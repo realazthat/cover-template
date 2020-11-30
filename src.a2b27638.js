@@ -921,7 +921,710 @@ var global = arguments[3];
 
 },{}],"node_modules/parcel-bundler/src/builtins/_empty.js":[function(require,module,exports) {
 
-},{}],"node_modules/process/browser.js":[function(require,module,exports) {
+},{}],"node_modules/blob-polyfill/Blob.js":[function(require,module,exports) {
+var define;
+var global = arguments[3];
+/* Blob.js
+ * A Blob, File, FileReader & URL implementation.
+ * 2019-04-30
+ *
+ * By Eli Grey, http://eligrey.com
+ * By Jimmy Wärting, https://github.com/jimmywarting
+ * License: MIT
+ *   See https://github.com/eligrey/Blob.js/blob/master/LICENSE.md
+ */
+
+(function(global) {
+	(function (factory) {
+		if (typeof define === "function" && define.amd) {
+			// AMD. Register as an anonymous module.
+			define(["exports"], factory);
+		} else if (typeof exports === "object" && typeof exports.nodeName !== "string") {
+			// CommonJS
+			factory(exports);
+		} else {
+			// Browser globals
+			factory(global);
+		}
+	})(function (exports) {
+		"use strict";
+
+		var BlobBuilder = global.BlobBuilder
+			|| global.WebKitBlobBuilder
+			|| global.MSBlobBuilder
+			|| global.MozBlobBuilder;
+
+		var URL = global.URL || global.webkitURL || function (href, a) {
+			a = document.createElement("a");
+			a.href = href;
+			return a;
+		};
+
+		var origBlob = global.Blob;
+		var createObjectURL = URL.createObjectURL;
+		var revokeObjectURL = URL.revokeObjectURL;
+		var strTag = global.Symbol && global.Symbol.toStringTag;
+		var blobSupported = false;
+		var blobSupportsArrayBufferView = false;
+		var arrayBufferSupported = !!global.ArrayBuffer;
+		var blobBuilderSupported = BlobBuilder
+			&& BlobBuilder.prototype.append
+			&& BlobBuilder.prototype.getBlob;
+
+		try {
+			// Check if Blob constructor is supported
+			blobSupported = new Blob(["ä"]).size === 2;
+
+			// Check if Blob constructor supports ArrayBufferViews
+			// Fails in Safari 6, so we need to map to ArrayBuffers there.
+			blobSupportsArrayBufferView = new Blob([new Uint8Array([1, 2])]).size === 2;
+		} catch (e) {/**/}
+
+
+		// Helper function that maps ArrayBufferViews to ArrayBuffers
+		// Used by BlobBuilder constructor and old browsers that didn't
+		// support it in the Blob constructor.
+		function mapArrayBufferViews (ary) {
+			return ary.map(function (chunk) {
+				if (chunk.buffer instanceof ArrayBuffer) {
+					var buf = chunk.buffer;
+
+					// if this is a subarray, make a copy so we only
+					// include the subarray region from the underlying buffer
+					if (chunk.byteLength !== buf.byteLength) {
+						var copy = new Uint8Array(chunk.byteLength);
+						copy.set(new Uint8Array(buf, chunk.byteOffset, chunk.byteLength));
+						buf = copy.buffer;
+					}
+
+					return buf;
+				}
+
+				return chunk;
+			});
+		}
+
+		function BlobBuilderConstructor (ary, options) {
+			options = options || {};
+
+			var bb = new BlobBuilder();
+			mapArrayBufferViews(ary).forEach(function (part) {
+				bb.append(part);
+			});
+
+			return options.type ? bb.getBlob(options.type) : bb.getBlob();
+		}
+
+		function BlobConstructor (ary, options) {
+			return new origBlob(mapArrayBufferViews(ary), options || {});
+		}
+
+		if (global.Blob) {
+			BlobBuilderConstructor.prototype = Blob.prototype;
+			BlobConstructor.prototype = Blob.prototype;
+		}
+
+		/********************************************************/
+		/*               String Encoder fallback                */
+		/********************************************************/
+		function stringEncode (string) {
+			var pos = 0;
+			var len = string.length;
+			var Arr = global.Uint8Array || Array; // Use byte array when possible
+
+			var at = 0; // output position
+			var tlen = Math.max(32, len + (len >> 1) + 7); // 1.5x size
+			var target = new Arr((tlen >> 3) << 3); // ... but at 8 byte offset
+
+			while (pos < len) {
+				var value = string.charCodeAt(pos++);
+				if (value >= 0xd800 && value <= 0xdbff) {
+					// high surrogate
+					if (pos < len) {
+						var extra = string.charCodeAt(pos);
+						if ((extra & 0xfc00) === 0xdc00) {
+							++pos;
+							value = ((value & 0x3ff) << 10) + (extra & 0x3ff) + 0x10000;
+						}
+					}
+					if (value >= 0xd800 && value <= 0xdbff) {
+						continue; // drop lone surrogate
+					}
+				}
+
+				// expand the buffer if we couldn't write 4 bytes
+				if (at + 4 > target.length) {
+					tlen += 8; // minimum extra
+					tlen *= (1.0 + (pos / string.length) * 2); // take 2x the remaining
+					tlen = (tlen >> 3) << 3; // 8 byte offset
+
+					var update = new Uint8Array(tlen);
+					update.set(target);
+					target = update;
+				}
+
+				if ((value & 0xffffff80) === 0) { // 1-byte
+					target[at++] = value; // ASCII
+					continue;
+				} else if ((value & 0xfffff800) === 0) { // 2-byte
+					target[at++] = ((value >> 6) & 0x1f) | 0xc0;
+				} else if ((value & 0xffff0000) === 0) { // 3-byte
+					target[at++] = ((value >> 12) & 0x0f) | 0xe0;
+					target[at++] = ((value >> 6) & 0x3f) | 0x80;
+				} else if ((value & 0xffe00000) === 0) { // 4-byte
+					target[at++] = ((value >> 18) & 0x07) | 0xf0;
+					target[at++] = ((value >> 12) & 0x3f) | 0x80;
+					target[at++] = ((value >> 6) & 0x3f) | 0x80;
+				} else {
+					// FIXME: do we care
+					continue;
+				}
+
+				target[at++] = (value & 0x3f) | 0x80;
+			}
+
+			return target.slice(0, at);
+		}
+
+		/********************************************************/
+		/*               String Decoder fallback                */
+		/********************************************************/
+		function stringDecode (buf) {
+			var end = buf.length;
+			var res = [];
+
+			var i = 0;
+			while (i < end) {
+				var firstByte = buf[i];
+				var codePoint = null;
+				var bytesPerSequence = (firstByte > 0xEF) ? 4
+					: (firstByte > 0xDF) ? 3
+						: (firstByte > 0xBF) ? 2
+							: 1;
+
+				if (i + bytesPerSequence <= end) {
+					var secondByte, thirdByte, fourthByte, tempCodePoint;
+
+					switch (bytesPerSequence) {
+					case 1:
+						if (firstByte < 0x80) {
+							codePoint = firstByte;
+						}
+						break;
+					case 2:
+						secondByte = buf[i + 1];
+						if ((secondByte & 0xC0) === 0x80) {
+							tempCodePoint = (firstByte & 0x1F) << 0x6 | (secondByte & 0x3F);
+							if (tempCodePoint > 0x7F) {
+								codePoint = tempCodePoint;
+							}
+						}
+						break;
+					case 3:
+						secondByte = buf[i + 1];
+						thirdByte = buf[i + 2];
+						if ((secondByte & 0xC0) === 0x80 && (thirdByte & 0xC0) === 0x80) {
+							tempCodePoint = (firstByte & 0xF) << 0xC | (secondByte & 0x3F) << 0x6 | (thirdByte & 0x3F);
+							if (tempCodePoint > 0x7FF && (tempCodePoint < 0xD800 || tempCodePoint > 0xDFFF)) {
+								codePoint = tempCodePoint;
+							}
+						}
+						break;
+					case 4:
+						secondByte = buf[i + 1];
+						thirdByte = buf[i + 2];
+						fourthByte = buf[i + 3];
+						if ((secondByte & 0xC0) === 0x80 && (thirdByte & 0xC0) === 0x80 && (fourthByte & 0xC0) === 0x80) {
+							tempCodePoint = (firstByte & 0xF) << 0x12 | (secondByte & 0x3F) << 0xC | (thirdByte & 0x3F) << 0x6 | (fourthByte & 0x3F);
+							if (tempCodePoint > 0xFFFF && tempCodePoint < 0x110000) {
+								codePoint = tempCodePoint;
+							}
+						}
+					}
+				}
+
+				if (codePoint === null) {
+					// we did not generate a valid codePoint so insert a
+					// replacement char (U+FFFD) and advance only 1 byte
+					codePoint = 0xFFFD;
+					bytesPerSequence = 1;
+				} else if (codePoint > 0xFFFF) {
+					// encode to utf16 (surrogate pair dance)
+					codePoint -= 0x10000;
+					res.push(codePoint >>> 10 & 0x3FF | 0xD800);
+					codePoint = 0xDC00 | codePoint & 0x3FF;
+				}
+
+				res.push(codePoint);
+				i += bytesPerSequence;
+			}
+
+			var len = res.length;
+			var str = "";
+			var j = 0;
+
+			while (j < len) {
+				str += String.fromCharCode.apply(String, res.slice(j, j += 0x1000));
+			}
+
+			return str;
+		}
+
+		// string -> buffer
+		var textEncode = typeof TextEncoder === "function"
+			? TextEncoder.prototype.encode.bind(new TextEncoder())
+			: stringEncode;
+
+		// buffer -> string
+		var textDecode = typeof TextDecoder === "function"
+			? TextDecoder.prototype.decode.bind(new TextDecoder())
+			: stringDecode;
+
+		function FakeBlobBuilder () {
+			function isDataView (obj) {
+				return obj && Object.prototype.isPrototypeOf.call(DataView, obj);
+			}
+			function bufferClone (buf) {
+				var view = new Array(buf.byteLength);
+				var array = new Uint8Array(buf);
+				var i = view.length;
+				while (i--) {
+					view[i] = array[i];
+				}
+				return view;
+			}
+			function array2base64 (input) {
+				var byteToCharMap = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+
+				var output = [];
+
+				for (var i = 0; i < input.length; i += 3) {
+					var byte1 = input[i];
+					var haveByte2 = i + 1 < input.length;
+					var byte2 = haveByte2 ? input[i + 1] : 0;
+					var haveByte3 = i + 2 < input.length;
+					var byte3 = haveByte3 ? input[i + 2] : 0;
+
+					var outByte1 = byte1 >> 2;
+					var outByte2 = ((byte1 & 0x03) << 4) | (byte2 >> 4);
+					var outByte3 = ((byte2 & 0x0F) << 2) | (byte3 >> 6);
+					var outByte4 = byte3 & 0x3F;
+
+					if (!haveByte3) {
+						outByte4 = 64;
+
+						if (!haveByte2) {
+							outByte3 = 64;
+						}
+					}
+
+					output.push(
+						byteToCharMap[outByte1], byteToCharMap[outByte2],
+						byteToCharMap[outByte3], byteToCharMap[outByte4]
+					);
+				}
+
+				return output.join("");
+			}
+
+			var create = Object.create || function (a) {
+				function c () {}
+				c.prototype = a;
+				return new c();
+			};
+
+			if (arrayBufferSupported) {
+				var viewClasses = [
+					"[object Int8Array]",
+					"[object Uint8Array]",
+					"[object Uint8ClampedArray]",
+					"[object Int16Array]",
+					"[object Uint16Array]",
+					"[object Int32Array]",
+					"[object Uint32Array]",
+					"[object Float32Array]",
+					"[object Float64Array]"
+				];
+
+				var isArrayBufferView = ArrayBuffer.isView || function (obj) {
+					return obj && viewClasses.indexOf(Object.prototype.toString.call(obj)) > -1;
+				};
+			}
+
+			function concatTypedarrays (chunks) {
+				var size = 0;
+				var j = chunks.length;
+				while (j--) { size += chunks[j].length; }
+				var b = new Uint8Array(size);
+				var offset = 0;
+				for (var i = 0; i < chunks.length; i++) {
+					var chunk = chunks[i];
+					b.set(chunk, offset);
+					offset += chunk.byteLength || chunk.length;
+				}
+
+				return b;
+			}
+
+			/********************************************************/
+			/*                   Blob constructor                   */
+			/********************************************************/
+			function Blob (chunks, opts) {
+				chunks = chunks || [];
+				opts = opts == null ? {} : opts;
+				for (var i = 0, len = chunks.length; i < len; i++) {
+					var chunk = chunks[i];
+					if (chunk instanceof Blob) {
+						chunks[i] = chunk._buffer;
+					} else if (typeof chunk === "string") {
+						chunks[i] = textEncode(chunk);
+					} else if (arrayBufferSupported && (Object.prototype.isPrototypeOf.call(ArrayBuffer, chunk) || isArrayBufferView(chunk))) {
+						chunks[i] = bufferClone(chunk);
+					} else if (arrayBufferSupported && isDataView(chunk)) {
+						chunks[i] = bufferClone(chunk.buffer);
+					} else {
+						chunks[i] = textEncode(String(chunk));
+					}
+				}
+
+				this._buffer = global.Uint8Array
+					? concatTypedarrays(chunks)
+					: [].concat.apply([], chunks);
+				this.size = this._buffer.length;
+
+				this.type = opts.type || "";
+				if (/[^\u0020-\u007E]/.test(this.type)) {
+					this.type = "";
+				} else {
+					this.type = this.type.toLowerCase();
+				}
+			}
+
+			Blob.prototype.arrayBuffer = function () {
+				return Promise.resolve(this._buffer);
+			};
+
+			Blob.prototype.text = function () {
+				return Promise.resolve(textDecode(this._buffer));
+			};
+
+			Blob.prototype.slice = function (start, end, type) {
+				var slice = this._buffer.slice(start || 0, end || this._buffer.length);
+				return new Blob([slice], {type: type});
+			};
+
+			Blob.prototype.toString = function () {
+				return "[object Blob]";
+			};
+
+			/********************************************************/
+			/*                   File constructor                   */
+			/********************************************************/
+			function File (chunks, name, opts) {
+				opts = opts || {};
+				var a = Blob.call(this, chunks, opts) || this;
+				a.name = name.replace(/\//g, ":");
+				a.lastModifiedDate = opts.lastModified ? new Date(opts.lastModified) : new Date();
+				a.lastModified = +a.lastModifiedDate;
+
+				return a;
+			}
+
+			File.prototype = create(Blob.prototype);
+			File.prototype.constructor = File;
+
+			if (Object.setPrototypeOf) {
+				Object.setPrototypeOf(File, Blob);
+			} else {
+				try {
+					File.__proto__ = Blob;
+				} catch (e) {/**/}
+			}
+
+			File.prototype.toString = function () {
+				return "[object File]";
+			};
+
+			/********************************************************/
+			/*                FileReader constructor                */
+			/********************************************************/
+			function FileReader () {
+				if (!(this instanceof FileReader)) {
+					throw new TypeError("Failed to construct 'FileReader': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+				}
+
+				var delegate = document.createDocumentFragment();
+				this.addEventListener = delegate.addEventListener;
+				this.dispatchEvent = function (evt) {
+					var local = this["on" + evt.type];
+					if (typeof local === "function") local(evt);
+					delegate.dispatchEvent(evt);
+				};
+				this.removeEventListener = delegate.removeEventListener;
+			}
+
+			function _read (fr, blob, kind) {
+				if (!(blob instanceof Blob)) {
+					throw new TypeError("Failed to execute '" + kind + "' on 'FileReader': parameter 1 is not of type 'Blob'.");
+				}
+
+				fr.result = "";
+
+				setTimeout(function () {
+					this.readyState = FileReader.LOADING;
+					fr.dispatchEvent(new Event("load"));
+					fr.dispatchEvent(new Event("loadend"));
+				});
+			}
+
+			FileReader.EMPTY = 0;
+			FileReader.LOADING = 1;
+			FileReader.DONE = 2;
+			FileReader.prototype.error = null;
+			FileReader.prototype.onabort = null;
+			FileReader.prototype.onerror = null;
+			FileReader.prototype.onload = null;
+			FileReader.prototype.onloadend = null;
+			FileReader.prototype.onloadstart = null;
+			FileReader.prototype.onprogress = null;
+
+			FileReader.prototype.readAsDataURL = function (blob) {
+				_read(this, blob, "readAsDataURL");
+				this.result = "data:" + blob.type + ";base64," + array2base64(blob._buffer);
+			};
+
+			FileReader.prototype.readAsText = function (blob) {
+				_read(this, blob, "readAsText");
+				this.result = textDecode(blob._buffer);
+			};
+
+			FileReader.prototype.readAsArrayBuffer = function (blob) {
+				_read(this, blob, "readAsText");
+				// return ArrayBuffer when possible
+				this.result = (blob._buffer.buffer || blob._buffer).slice();
+			};
+
+			FileReader.prototype.abort = function () {};
+
+			/********************************************************/
+			/*                         URL                          */
+			/********************************************************/
+			URL.createObjectURL = function (blob) {
+				return blob instanceof Blob
+					? "data:" + blob.type + ";base64," + array2base64(blob._buffer)
+					: createObjectURL.call(URL, blob);
+			};
+
+			URL.revokeObjectURL = function (url) {
+				revokeObjectURL && revokeObjectURL.call(URL, url);
+			};
+
+			/********************************************************/
+			/*                         XHR                          */
+			/********************************************************/
+			var _send = global.XMLHttpRequest && global.XMLHttpRequest.prototype.send;
+			if (_send) {
+				XMLHttpRequest.prototype.send = function (data) {
+					if (data instanceof Blob) {
+						this.setRequestHeader("Content-Type", data.type);
+						_send.call(this, textDecode(data._buffer));
+					} else {
+						_send.call(this, data);
+					}
+				};
+			}
+
+			exports.Blob = Blob;
+			exports.File = File;
+			exports.FileReader = FileReader;
+			exports.URL = URL;
+		}
+
+		function fixFileAndXHR () {
+			var isIE = !!global.ActiveXObject || (
+				"-ms-scroll-limit" in document.documentElement.style &&
+				"-ms-ime-align" in document.documentElement.style
+			);
+
+			// Monkey patched
+			// IE doesn't set Content-Type header on XHR whose body is a typed Blob
+			// https://developer.microsoft.com/en-us/microsoft-edge/platform/issues/6047383
+			var _send = global.XMLHttpRequest && global.XMLHttpRequest.prototype.send;
+			if (isIE && _send) {
+				XMLHttpRequest.prototype.send = function (data) {
+					if (data instanceof Blob) {
+						this.setRequestHeader("Content-Type", data.type);
+						_send.call(this, data);
+					} else {
+						_send.call(this, data);
+					}
+				};
+			}
+
+			try {
+				new File([], "");
+				exports.File = global.File;
+				exports.FileReader = global.FileReader;
+			} catch (e) {
+				try {
+					exports.File = new Function("class File extends Blob {" +
+						"constructor(chunks, name, opts) {" +
+							"opts = opts || {};" +
+							"super(chunks, opts || {});" +
+							"this.name = name.replace(/\\//g, \":\");" +
+							"this.lastModifiedDate = opts.lastModified ? new Date(opts.lastModified) : new Date();" +
+							"this.lastModified = +this.lastModifiedDate;" +
+						"}};" +
+						"return new File([], \"\"), File"
+					)();
+				} catch (e) {
+					exports.File = function (b, d, c) {
+						var blob = new Blob(b, c);
+						var t = c && void 0 !== c.lastModified ? new Date(c.lastModified) : new Date();
+
+						blob.name = d.replace(/\//g, ":");
+						blob.lastModifiedDate = t;
+						blob.lastModified = +t;
+						blob.toString = function () {
+							return "[object File]";
+						};
+
+						if (strTag) {
+							blob[strTag] = "File";
+						}
+
+						return blob;
+					};
+				}
+			}
+		}
+
+		if (blobSupported) {
+			fixFileAndXHR();
+			exports.Blob = blobSupportsArrayBufferView ? global.Blob : BlobConstructor;
+		} else if (blobBuilderSupported) {
+			fixFileAndXHR();
+			exports.Blob = BlobBuilderConstructor;
+		} else {
+			FakeBlobBuilder();
+		}
+
+		if (strTag) {
+			if (!exports.File.prototype[strTag]) exports.File.prototype[strTag] = "File";
+			if (!exports.Blob.prototype[strTag]) exports.Blob.prototype[strTag] = "Blob";
+			if (!exports.FileReader.prototype[strTag]) exports.FileReader.prototype[strTag] = "FileReader";
+		}
+
+		var blob = exports.Blob.prototype;
+		var stream;
+
+		try {
+			new ReadableStream({ type: "bytes" });
+			stream = function stream() {
+				var position = 0;
+				var blob = this;
+
+				return new ReadableStream({
+					type: "bytes",
+					autoAllocateChunkSize: 524288,
+
+					pull: function (controller) {
+						var v = controller.byobRequest.view;
+						var chunk = blob.slice(position, position + v.byteLength);
+						return chunk.arrayBuffer()
+							.then(function (buffer) {
+								var uint8array = new Uint8Array(buffer);
+								var bytesRead = uint8array.byteLength;
+
+								position += bytesRead;
+								v.set(uint8array);
+								controller.byobRequest.respond(bytesRead);
+
+								if(position >= blob.size)
+									controller.close();
+							});
+					}
+				});
+			};
+		} catch (e) {
+			try {
+				new ReadableStream({});
+				stream = function stream(blob){
+					var position = 0;
+
+					return new ReadableStream({
+						pull: function (controller) {
+							var chunk = blob.slice(position, position + 524288);
+
+							return chunk.arrayBuffer().then(function (buffer) {
+								position += buffer.byteLength;
+								var uint8array = new Uint8Array(buffer);
+								controller.enqueue(uint8array);
+
+								if (position == blob.size)
+									controller.close();
+							});
+						}
+					});
+				};
+			} catch (e) {
+				try {
+					new Response("").body.getReader().read();
+					stream = function stream() {
+						return (new Response(this)).body;
+					};
+				} catch (e) {
+					stream = function stream() {
+						throw new Error("Include https://github.com/MattiasBuelens/web-streams-polyfill");
+					};
+				}
+			}
+		}
+
+		function promisify(obj) {
+			return new Promise(function(resolve, reject) {
+				obj.onload = obj.onerror = function(evt) {
+					obj.onload = obj.onerror = null;
+
+					evt.type === "load" ?
+						resolve(obj.result || obj) :
+						reject(new Error("Failed to read the blob/file"));
+				};
+			});
+		}
+
+		if (!blob.arrayBuffer) {
+			blob.arrayBuffer = function arrayBuffer() {
+				var fr = new FileReader();
+				fr.readAsArrayBuffer(this);
+				return promisify(fr);
+			};
+		}
+
+		if (!blob.text) {
+			blob.text = function text() {
+				var fr = new FileReader();
+				fr.readAsText(this);
+				return promisify(fr);
+			};
+		}
+
+		if (!blob.stream) {
+			blob.stream = stream;
+		}
+	});
+})(
+	typeof self !== "undefined" && self ||
+		typeof window !== "undefined" && window ||
+		typeof global !== "undefined" && global ||
+		this
+);
+
+},{}],"node_modules/cross-blob/browser.js":[function(require,module,exports) {
+"use strict";
+
+module.exports = require("blob-polyfill").Blob;
+},{"blob-polyfill":"node_modules/blob-polyfill/Blob.js"}],"node_modules/process/browser.js":[function(require,module,exports) {
 
 // shim for using process in browser
 var process = module.exports = {}; // cached from whatever global is present so that test runners that stub it
@@ -1130,312 +1833,7 @@ process.chdir = function (dir) {
 process.umask = function () {
   return 0;
 };
-},{}],"node_modules/path-browserify/index.js":[function(require,module,exports) {
-var process = require("process");
-// .dirname, .basename, and .extname methods are extracted from Node.js v8.11.1,
-// backported and transplited with Babel, with backwards-compat fixes
-
-// Copyright Joyent, Inc. and other Node contributors.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a
-// copy of this software and associated documentation files (the
-// "Software"), to deal in the Software without restriction, including
-// without limitation the rights to use, copy, modify, merge, publish,
-// distribute, sublicense, and/or sell copies of the Software, and to permit
-// persons to whom the Software is furnished to do so, subject to the
-// following conditions:
-//
-// The above copyright notice and this permission notice shall be included
-// in all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
-// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
-// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
-// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-// USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-// resolves . and .. elements in a path array with directory names there
-// must be no slashes, empty elements, or device names (c:\) in the array
-// (so also no leading and trailing slashes - it does not distinguish
-// relative and absolute paths)
-function normalizeArray(parts, allowAboveRoot) {
-  // if the path tries to go above the root, `up` ends up > 0
-  var up = 0;
-  for (var i = parts.length - 1; i >= 0; i--) {
-    var last = parts[i];
-    if (last === '.') {
-      parts.splice(i, 1);
-    } else if (last === '..') {
-      parts.splice(i, 1);
-      up++;
-    } else if (up) {
-      parts.splice(i, 1);
-      up--;
-    }
-  }
-
-  // if the path is allowed to go above the root, restore leading ..s
-  if (allowAboveRoot) {
-    for (; up--; up) {
-      parts.unshift('..');
-    }
-  }
-
-  return parts;
-}
-
-// path.resolve([from ...], to)
-// posix version
-exports.resolve = function() {
-  var resolvedPath = '',
-      resolvedAbsolute = false;
-
-  for (var i = arguments.length - 1; i >= -1 && !resolvedAbsolute; i--) {
-    var path = (i >= 0) ? arguments[i] : process.cwd();
-
-    // Skip empty and invalid entries
-    if (typeof path !== 'string') {
-      throw new TypeError('Arguments to path.resolve must be strings');
-    } else if (!path) {
-      continue;
-    }
-
-    resolvedPath = path + '/' + resolvedPath;
-    resolvedAbsolute = path.charAt(0) === '/';
-  }
-
-  // At this point the path should be resolved to a full absolute path, but
-  // handle relative paths to be safe (might happen when process.cwd() fails)
-
-  // Normalize the path
-  resolvedPath = normalizeArray(filter(resolvedPath.split('/'), function(p) {
-    return !!p;
-  }), !resolvedAbsolute).join('/');
-
-  return ((resolvedAbsolute ? '/' : '') + resolvedPath) || '.';
-};
-
-// path.normalize(path)
-// posix version
-exports.normalize = function(path) {
-  var isAbsolute = exports.isAbsolute(path),
-      trailingSlash = substr(path, -1) === '/';
-
-  // Normalize the path
-  path = normalizeArray(filter(path.split('/'), function(p) {
-    return !!p;
-  }), !isAbsolute).join('/');
-
-  if (!path && !isAbsolute) {
-    path = '.';
-  }
-  if (path && trailingSlash) {
-    path += '/';
-  }
-
-  return (isAbsolute ? '/' : '') + path;
-};
-
-// posix version
-exports.isAbsolute = function(path) {
-  return path.charAt(0) === '/';
-};
-
-// posix version
-exports.join = function() {
-  var paths = Array.prototype.slice.call(arguments, 0);
-  return exports.normalize(filter(paths, function(p, index) {
-    if (typeof p !== 'string') {
-      throw new TypeError('Arguments to path.join must be strings');
-    }
-    return p;
-  }).join('/'));
-};
-
-
-// path.relative(from, to)
-// posix version
-exports.relative = function(from, to) {
-  from = exports.resolve(from).substr(1);
-  to = exports.resolve(to).substr(1);
-
-  function trim(arr) {
-    var start = 0;
-    for (; start < arr.length; start++) {
-      if (arr[start] !== '') break;
-    }
-
-    var end = arr.length - 1;
-    for (; end >= 0; end--) {
-      if (arr[end] !== '') break;
-    }
-
-    if (start > end) return [];
-    return arr.slice(start, end - start + 1);
-  }
-
-  var fromParts = trim(from.split('/'));
-  var toParts = trim(to.split('/'));
-
-  var length = Math.min(fromParts.length, toParts.length);
-  var samePartsLength = length;
-  for (var i = 0; i < length; i++) {
-    if (fromParts[i] !== toParts[i]) {
-      samePartsLength = i;
-      break;
-    }
-  }
-
-  var outputParts = [];
-  for (var i = samePartsLength; i < fromParts.length; i++) {
-    outputParts.push('..');
-  }
-
-  outputParts = outputParts.concat(toParts.slice(samePartsLength));
-
-  return outputParts.join('/');
-};
-
-exports.sep = '/';
-exports.delimiter = ':';
-
-exports.dirname = function (path) {
-  if (typeof path !== 'string') path = path + '';
-  if (path.length === 0) return '.';
-  var code = path.charCodeAt(0);
-  var hasRoot = code === 47 /*/*/;
-  var end = -1;
-  var matchedSlash = true;
-  for (var i = path.length - 1; i >= 1; --i) {
-    code = path.charCodeAt(i);
-    if (code === 47 /*/*/) {
-        if (!matchedSlash) {
-          end = i;
-          break;
-        }
-      } else {
-      // We saw the first non-path separator
-      matchedSlash = false;
-    }
-  }
-
-  if (end === -1) return hasRoot ? '/' : '.';
-  if (hasRoot && end === 1) {
-    // return '//';
-    // Backwards-compat fix:
-    return '/';
-  }
-  return path.slice(0, end);
-};
-
-function basename(path) {
-  if (typeof path !== 'string') path = path + '';
-
-  var start = 0;
-  var end = -1;
-  var matchedSlash = true;
-  var i;
-
-  for (i = path.length - 1; i >= 0; --i) {
-    if (path.charCodeAt(i) === 47 /*/*/) {
-        // If we reached a path separator that was not part of a set of path
-        // separators at the end of the string, stop now
-        if (!matchedSlash) {
-          start = i + 1;
-          break;
-        }
-      } else if (end === -1) {
-      // We saw the first non-path separator, mark this as the end of our
-      // path component
-      matchedSlash = false;
-      end = i + 1;
-    }
-  }
-
-  if (end === -1) return '';
-  return path.slice(start, end);
-}
-
-// Uses a mixed approach for backwards-compatibility, as ext behavior changed
-// in new Node.js versions, so only basename() above is backported here
-exports.basename = function (path, ext) {
-  var f = basename(path);
-  if (ext && f.substr(-1 * ext.length) === ext) {
-    f = f.substr(0, f.length - ext.length);
-  }
-  return f;
-};
-
-exports.extname = function (path) {
-  if (typeof path !== 'string') path = path + '';
-  var startDot = -1;
-  var startPart = 0;
-  var end = -1;
-  var matchedSlash = true;
-  // Track the state of characters (if any) we see before our first dot and
-  // after any path separator we find
-  var preDotState = 0;
-  for (var i = path.length - 1; i >= 0; --i) {
-    var code = path.charCodeAt(i);
-    if (code === 47 /*/*/) {
-        // If we reached a path separator that was not part of a set of path
-        // separators at the end of the string, stop now
-        if (!matchedSlash) {
-          startPart = i + 1;
-          break;
-        }
-        continue;
-      }
-    if (end === -1) {
-      // We saw the first non-path separator, mark this as the end of our
-      // extension
-      matchedSlash = false;
-      end = i + 1;
-    }
-    if (code === 46 /*.*/) {
-        // If this is our first dot, mark it as the start of our extension
-        if (startDot === -1)
-          startDot = i;
-        else if (preDotState !== 1)
-          preDotState = 1;
-    } else if (startDot !== -1) {
-      // We saw a non-dot and non-path separator before our dot, so we should
-      // have a good chance at having a non-empty extension
-      preDotState = -1;
-    }
-  }
-
-  if (startDot === -1 || end === -1 ||
-      // We saw a non-dot character immediately before the dot
-      preDotState === 0 ||
-      // The (right-most) trimmed path component is exactly '..'
-      preDotState === 1 && startDot === end - 1 && startDot === startPart + 1) {
-    return '';
-  }
-  return path.slice(startDot, end);
-};
-
-function filter (xs, f) {
-    if (xs.filter) return xs.filter(f);
-    var res = [];
-    for (var i = 0; i < xs.length; i++) {
-        if (f(xs[i], i, xs)) res.push(xs[i]);
-    }
-    return res;
-}
-
-// String.prototype.substr - negative index don't work in IE8
-var substr = 'ab'.substr(-1) === 'b'
-    ? function (str, start, len) { return str.substr(start, len) }
-    : function (str, start, len) {
-        if (start < 0) start = str.length + start;
-        return str.substr(start, len);
-    }
-;
-
-},{"process":"node_modules/process/browser.js"}],"node_modules/jquery/dist/jquery.js":[function(require,module,exports) {
+},{}],"node_modules/jquery/dist/jquery.js":[function(require,module,exports) {
 var global = arguments[3];
 var process = require("process");
 var define;
@@ -73658,29 +74056,29 @@ function _defineProperties(target, props) { for (var i = 0; i < props.length; i+
 
 function _createClass(Constructor, protoProps, staticProps) { if (protoProps) _defineProperties(Constructor.prototype, protoProps); if (staticProps) _defineProperties(Constructor, staticProps); return Constructor; }
 
-var path = require("path");
+var Blob = require('cross-blob');
 
-var $ = require("jquery");
+var $ = require('jquery');
 
-var nunjucks = require("nunjucks");
+var nunjucks = require('nunjucks');
 
-var assert = require("assert");
+var assert = require('assert');
 
-var FileSaver = require("file-saver");
+var FileSaver = require('file-saver');
 
-var BlobStream = require("blob-stream");
+var BlobStream = require('blob-stream');
 
-var PDFDocument = require("pdfkit-browserify");
+var PDFDocument = require('pdfkit-browserify');
 
-var SVGtoPDF = require("svg-to-pdfkit");
+var SVGtoPDF = require('svg-to-pdfkit');
 
 var template = "\r\n{% set bleedLight = \"#f7dfdc\" %}\r\n{% set bleedDark = \"#c1210f\" %}\r\n{% set marginLight = \"#d2e8f1\" %}\r\n{% set marginDark = \"#4c9cc6\" %}\r\n{% set barcodeLight = \"#ffffff\" %}\r\n{% set barcodeDark = \"#000000\" %}\r\n{% set barcodeBorderColor = \"#ff5a00\" %}\r\n{% set printableAreaLight = \"#f9f8f4\" %}\r\n{% set printableAreaDark = \"#a9a8a4\" %}\r\n{% set fullMeasurementColor = \"#7b0f71\" %}\r\n{% set spineMeasurementDark = \"#f600ff\" %}\r\n{% set halfCoverMeasurementColor = \"#5bcc65\" %}\r\n{% set coverBorderColor = \"#00000044\" %}\r\n\r\n\r\n<!-- DONE: Go through everything and get rid of rects-as-lines  -->\r\n<!-- TODO: Reorder x1 x2 y1 y2 to x1 y1 x2 y2  -->\r\n<!-- TODO: Abstract \"top\", \"bottom\", \"left\", 'right\" into for loops -->\r\n<!-- TODO: Make vertical measurement text: vertical -->\r\n<!-- DONE: Parameterize all the color values -->\r\n<!-- TODO: Use tails for tails -->\r\n<!-- DONE: Use tails or arrows for everything -->\r\n<!-- TODO: Dashed line for cover border -->\r\n<!-- TODO: Rename coverWidth vs backCoverWidth -->\r\n<!-- TODO: Get rid of all % -->\r\n<!-- TODO: Double check all calc() calls to see if they are necessary -->\r\n<!-- TODO: Get Save PDF working -->\r\n<!-- TODO: Get Save SVG working -->\r\n<!-- TODO: Use good colors on html index page -->\r\n<!-- TODO: Verify colors against html of B&N page -->\r\n<!-- TODO: Show screenshot on index page -->\r\n<!-- TODO: Render miniature version -->\r\n\r\n<svg xmlns=\"http://www.w3.org/2000/svg\"\r\n  width=\"{{ fullWidth }}in\" height=\"{{ fullHeight }}in\">\r\n  <style>\r\n    text {\r\n      text-rendering: geometricPrecision;\r\n    }\r\n  </style>\r\n  <!-- bleed section -->\r\n  <rect x=\"0\" y=\"0\" width=\"100%\" height=\"100%\"\r\n    style=\"fill:{{ bleedLight }};\" />\r\n  <text x=\"1em\" y=\"1em\" style=\"stroke:{{ bleedDark }};\">Bleed</text>\r\n  \r\n  \r\n  <!-- margin section -->\r\n  <svg x=\"{{ bleed }}in\" y=\"{{ bleed }}in\"\r\n      width=\"{{ fullWidth - 2 * bleed }}in\" height=\"{{ fullHeight - 2 * bleed }}in\">\r\n    <rect x=\"0\" y=\"0\" width=\"100%\" height=\"100%\"\r\n      style=\"fill:{{ marginLight }};\" />\r\n    <text x=\"0\" y=\"1em\" style=\"stroke:{{ marginDark }};\">Margin</text>\r\n  </svg>\r\n  \r\n  {% set backCoverWidth = coverWidth - margin - spineMargin - bleed %}\r\n  {% set backCoverHeight = fullHeight - 2*(margin+bleed) %}\r\n  {% set backCoverRight = coverWidth - spineMargin %}\r\n  {% set backCoverBottom = backCoverHeight + bleed + margin %}\r\n  <!-- back cover section -->\r\n  <svg x=\"{{ bleed + margin }}in\" y=\"{{ bleed + margin }}in\"\r\n    width=\"{{ backCoverWidth }}in\" height=\"{{ backCoverHeight }}in\">\r\n    <rect x=\"0\" y=\"0\" width=\"100%\" height=\"100%\"\r\n      style=\"fill: {{ printableAreaLight }};\r\n      stroke: {{ coverBorderColor }}; stroke-dasharray: 10 10; stroke-width: 3;\" />\r\n\r\n    <text x=\"0\" y=\"1em\" style=\"stroke:{{ printableAreaDark }};\">Back Cover</text>\r\n      \r\n  </svg>\r\n\r\n  <!-- barcode section -->\r\n  <svg x=\"{{ backCoverRight - barcodeWidth }}in\" y=\"{{ backCoverBottom - barcodeHeight }}in\"\r\n    width=\"{{ barcodeWidth }}in\" height=\"{{ barcodeHeight }}in\">\r\n    <rect x=\"0\" y=\"0\" width=\"100%\" height=\"100%\"\r\n      style=\"fill:{{ barcodeLight }}; stroke:{{ barcodeBorderColor }}; stroke-width: 2px;\" />\r\n    <text x=\"0\" y=\"1em\" style=\"stroke:{{ barcodeDark }};\">Barcode</text>\r\n  </svg>\r\n\r\n  <!-- spine section -->\r\n  <svg x=\"{{ coverWidth }}in\" y=\"{{ bleed }}in\"\r\n    width=\"{{ spineWidth }}in\" height=\"{{ fullHeight - (bleed) * 2 }}in\">\r\n    <rect x=\"0\" y=\"0\" width=\"100%\" height=\"100%\"\r\n      style=\"fill:{{ printableAreaLight }};\" />\r\n    <text x=\"50%\" y=\"1em\" text-anchor=\"middle\" style=\"stroke:{{ printableAreaDark }};\">Spine</text>\r\n  </svg>\r\n\r\n  <!-- front cover section -->\r\n  <svg x=\"{{ coverWidth + spineWidth + spineMargin }}in\" y=\"{{ bleed + margin }}in\"\r\n    width=\"{{ backCoverWidth }}in\" height=\"{{ backCoverHeight }}in\">\r\n    <rect x=\"0\" y=\"0\" width=\"100%\" height=\"100%\"\r\n      style=\"fill:{{ printableAreaLight }};\r\n      stroke: {{ coverBorderColor }}; stroke-dasharray: 10 10; stroke-width: 3;\" />\r\n    <text x=\"0\" y=\"1em\" style=\"stroke:{{ printableAreaDark }};\">Front Cover</text>\r\n  </svg>\r\n    \r\n\r\n  <defs>\r\n\r\n    {% macro markerArrow(baseName, fill) %}\r\n    <marker id=\"{{ baseName }}-right\" viewBox=\"0 0 13 10\" refX=\"10\" refY=\"5\" markerWidth=\"3.5\" markerHeight=\"3.5\" orient=\"0\">\r\n        <path d=\"M 0 0  C 0 0, 3 5, 0 10   L 0 10  L 13 5\" fill=\"{{ fill }}\"/>\r\n    </marker>\r\n    <marker id=\"{{ baseName }}-left\" viewBox=\"0 0 13 10\" refX=\"10\" refY=\"5\" markerWidth=\"3.5\" markerHeight=\"3.5\" orient=\"180\">\r\n        <path d=\"M 0 0  C 0 0, 3 5, 0 10   L 0 10  L 13 5\" fill=\"{{ fill }}\"/>\r\n    </marker>\r\n    <marker id=\"{{ baseName }}-up\" viewBox=\"0 0 13 10\" refX=\"10\" refY=\"5\" markerWidth=\"3.5\" markerHeight=\"3.5\" orient=\"270\">\r\n        <path d=\"M 0 0  C 0 0, 3 5, 0 10   L 0 10  L 13 5\" fill=\"{{ fill }}\"/>\r\n    </marker>\r\n    <marker id=\"{{ baseName }}-down\" viewBox=\"0 0 13 10\" refX=\"10\" refY=\"5\" markerWidth=\"3.5\" markerHeight=\"3.5\" orient=\"90\">\r\n        <path d=\"M 0 0  C 0 0, 3 5, 0 10   L 0 10  L 13 5\" fill=\"{{ fill }}\"/>\r\n    </marker>\r\n    {% endmacro %}\r\n\r\n\r\n    {{ markerArrow(baseName=\"green-arrow\", fill=halfCoverMeasurementColor) }}\r\n    {{ markerArrow(baseName=\"purple-arrow\", fill=fullMeasurementColor) }}\r\n    {{ markerArrow(baseName=\"spine-arrow\", fill=spineMeasurementDark) }}\r\n    {{ markerArrow(baseName=\"blue-arrow\", fill=marginDark) }}\r\n    {{ markerArrow(baseName=\"margin-arrow\", fill=marginDark) }}\r\n    {{ markerArrow(baseName=\"bleed-arrow\", fill=bleedDark) }}\r\n\r\n  </defs>\r\n\r\n\r\n  <!-- DO NOT SUBMIT: Surgery  -->\r\n  <!-- Horizontal measurements -->\r\n\r\n\r\n  {% macro horizontalArrows(baseName, baseArrowName, color, yInches, x0Inches, x1Inches, literal, literalX0Inches) %}\r\n  <svg x=\"{{ x0Inches }}\" y=\"{{ yInches - 1 }}in\" style=\"overflow: visible;\">\r\n    {% set literalWidthEM = literal | string | length %}\r\n    {% set halfLiteralWidthEM = literalWidthEM / 2 %}\r\n    <defs>\r\n      <mask id=\"{{ baseName }}-mask\" maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"-50%\" width=\"100%\" height=\"100%\" >\r\n          <rect x=\"0\" y=\"-50%\" width=\"100%\" height=\"100%\" fill=\"white\"/>\r\n          <rect x=\"{{ literalX0Inches }}in\" y=\"-50%\" width=\"{{ literalWidthEM }}em\" height=\"100%\" fill=\"black\" />\r\n      </mask>\r\n    </defs>\r\n    <line \r\n      x1=\"1px\" y1=\"1in\" x2=\"{{ x1Inches }}in\" y2=\"1in\"\r\n      stroke=\"{{ color }}\" stroke-width=\"2px\"\r\n      mask=\"url(#{{ baseName }}-mask)\"\r\n      style=\"overflow: visible;\"\r\n      marker-start=\"url(#{{ baseArrowName }}-left)\" marker-end=\"url(#{{ baseArrowName }}-right)\" />\r\n    <svg x=\"{{ literalX0Inches }}in\">\r\n      <text x=\"{{ halfLiteralWidthEM }}em\" y=\"1in\"\r\n        style=\"stroke:{{ color }}; alignment-baseline:middle; overflow: visible;\"\r\n        text-anchor=\"middle\">\r\n      {{ literal }}\"\r\n      </text>\r\n    </svg>\r\n  </svg>\r\n  {% endmacro %}\r\n\r\n  <!-- measuring purple fullWidth horizontally across nearly  the entire width of\r\n  the book cover -->\r\n  {% set horizontalFullMeasurementY = bleed + margin + backCoverHeight * (2/20) %}\r\n  {% set horizontalLeftCoverMeasurementY = bleed + margin + backCoverHeight * (4/20) %}\r\n  {{ horizontalArrows(baseName='FullWidthLine',\r\n                      baseArrowName='purple-arrow',\r\n                      color=fullMeasurementColor,\r\n                      x0Inches='0',\r\n                      x1Inches=fullWidth,\r\n                      yInches=horizontalFullMeasurementY,\r\n                      literal=fullWidthLiteral,\r\n                      literalX0Inches=0.30 * fullWidth) }}\r\n\r\n  <!-- measuring green coverWidth on back cover (left), horizontally across nearly\r\n  the entire width of the back cover -->\r\n  {{ horizontalArrows(baseName='CoverWidthLine',\r\n                      baseArrowName='green-arrow',\r\n                      color=halfCoverMeasurementColor,\r\n                      x0Inches=0,\r\n                      x1Inches=coverWidth,\r\n                      yInches=horizontalLeftCoverMeasurementY,\r\n                      literal=coverWidthLiteral,\r\n                      literalX0Inches=0.23 * fullWidth) }}\r\n\r\n\r\n  {% macro verticalArrows(baseName, baseArrowName, color, xInches, y0Inches, y1Inches, literal, literalY0Inches) %}\r\n  <svg x=\"{{ xInches - 1}}in\" y=\"{{ y0Inches }}in\" style=\"overflow: visible;\">\r\n    <defs>\r\n      <mask id=\"{{ baseName }}-mask\" maskUnits=\"userSpaceOnUse\" x=\"-50%\" y=\"0\" width=\"100%\" height=\"100%\" >\r\n        <rect x=\"-50%\" y=\"0\" width=\"100%\" height=\"100%\" fill=\"white\"/>\r\n        <rect x=\"-50%\" y=\"{{ literalY0Inches }}in\" width=\"100%\" height=\"4em\" fill=\"black\" />\r\n      </mask>\r\n    </defs>\r\n    <line \r\n      x1=\"1in\" y1=\"1px\" x2=\"1in\" y2=\"{{ fullHeight }}in\"\r\n      stroke=\"{{ color }}\" stroke-width=\"2px\"\r\n      mask=\"url(#{{ baseName }}-mask)\"\r\n      marker-start=\"url(#{{ baseArrowName }}-up)\" marker-end=\"url(#{{ baseArrowName }}-down)\" />\r\n    <svg x=\"0\" y=\"{{ literalY0Inches }}in\">\r\n      <text x=\"1in\"\r\n        y=\"2em\" style=\"stroke:{{ color }}; alignment-baseline:middle\"\r\n        text-anchor=\"middle\">\r\n        {{ literal }}\"\r\n      </text>\r\n    </svg>\r\n  </svg>\r\n  {% endmacro %}\r\n\r\n  <!-- up down purple line with full hight -->\r\n  {{ verticalArrows(baseName='CoverHeightLine',\r\n                      baseArrowName='purple-arrow',\r\n                      color=fullMeasurementColor,\r\n                      y0Inches=0,\r\n                      y1Inches=fullHeight,\r\n                      xInches=margin + bleed + backCoverWidth * (3/16),\r\n                      literal=fullHeightLiteral,\r\n                      literalY0Inches=fullHeight / 2) }}\r\n\r\n\r\n  {% macro verticalMetric(baseArrowName, color, x0Inches, y0Inches, lengthInches, literal) %}\r\n  <svg x=\"{{ x0Inches - 1 }}in\" y=\"{{ y0Inches }}in\">\r\n    <line \r\n      x1=\"1in\" y1=\"0px\" x2=\"1in\" y2=\"{{ lengthInches }}in\"\r\n      stroke=\"{{ color }}\" stroke-width=\"3px\"\r\n      marker-start=\"url(#{{ baseArrowName }}-up)\"\r\n      marker-end=\"url(#{{ baseArrowName }}-down)\" \r\n      />\r\n    <svg x=\"1in\">\r\n      <text x=\"1em\" y=\"{{ lengthInches / 2 }}in\"\r\n        style=\"stroke:{{ color }}; alignment-baseline:middle\"\r\n        text-anchor=\"start\">{{ literal }}\"</text>\r\n    </svg>\r\n  </svg>\r\n  {% endmacro %}\r\n\r\n  {% for cover in ['back', 'front'] %}\r\n    {% if cover == 'back' %}\r\n      {% set verticalBleedMeasurementX = bleed + margin + backCoverWidth * (8 / 16) %}\r\n      {% set verticalMarginMeasurementX = bleed + margin + backCoverWidth * (7 / 16) %}\r\n    {% else %}\r\n      {% set verticalBleedMeasurementX = bleed + margin + backCoverWidth * (8 / 16) + coverWidth + spineWidth %}\r\n      {% set verticalMarginMeasurementX = bleed + margin + backCoverWidth * (9 / 16) + coverWidth + spineWidth %}\r\n    {% endif %}\r\n\r\n    {% for toporbottom in ['top', 'bottom'] %}\r\n      {% if toporbottom == 'top' %}\r\n        {% set verticalBleedMeasurementY = 0 %}\r\n        {% set verticalMarginMeasurementY = bleed %}\r\n      {% else %}\r\n        {% set verticalBleedMeasurementY = fullHeight - bleed %}\r\n        {% set verticalMarginMeasurementY = fullHeight - bleed - margin %}\r\n      {% endif %}\r\n\r\n      <!-- measuring vertical bleed on {{ toporbottom }}-->\r\n      {{ verticalMetric(baseArrowName='bleed-arrow',\r\n                        color=bleedDark,\r\n                        x0Inches=verticalBleedMeasurementX,\r\n                        y0Inches=verticalBleedMeasurementY,\r\n                        lengthInches=bleed,\r\n                        literal=bleedLiteral) }}\r\n      <!-- measuring vertical margin on {{ toporbottom }}-->\r\n      {{ verticalMetric(baseArrowName='margin-arrow',\r\n                        color=marginDark,\r\n                        x0Inches=verticalMarginMeasurementX,\r\n                        y0Inches=verticalMarginMeasurementY,\r\n                        lengthInches=margin,\r\n                        literal=marginLiteral) }}\r\n    {% endfor %}\r\n  {% endfor %}\r\n\r\n\r\n  {% macro horizontalMetric(baseArrowName, color, x0Inches, y0Inches, lengthInches, literal) %}\r\n  <svg x=\"{{ x0Inches - 1 }}in\" y=\"{{ y0Inches - 1 }}in\" style=\"overflow: visible;\">\r\n    <line \r\n      x1=\"1in\"  y1=\"1in\" x2=\"{{ lengthInches + 1 }}in\" y2=\"1in\"\r\n      style=\"overflow: visible;\"\r\n      stroke=\"{{ color }}\" stroke-width=\"3px\"\r\n      marker-start=\"url(#{{ baseArrowName }}-left)\"\r\n      marker-end=\"url(#{{ baseArrowName }}-right)\" \r\n      />\r\n    <svg x=\"1in\" y=\"1in\" style=\"overflow: visible;\">\r\n      <text x=\"{{ lengthInches / 2 }}in\" y=\"-1em\"\r\n       \r\n        style=\"stroke:{{ color }}; alignment-baseline:middle; overflow: visible;\"\r\n        text-anchor=\"middle\">{{ literal }}\"</text>\r\n    </svg>\r\n  </svg>\r\n  {% endmacro %}\r\n\r\n\r\n  {% for bleedSide in ['left', 'right'] %}\r\n    {% set horizontalBleedX = 0 if bleedSide == 'left' else (fullWidth - bleed) %}\r\n\r\n    <!-- measuring bleed on {{ bleedSide }} -->\r\n    {{ horizontalMetric(baseArrowName='bleed-arrow',\r\n                        color=bleedDark,\r\n                        x0Inches=horizontalBleedX,\r\n                        y0Inches=fullHeight * (8/16),\r\n                        lengthInches=bleed,\r\n                        literal=bleedLiteral) }}\r\n\r\n  {% endfor %}\r\n  {% for marginSide in ['far-left', 'spine-left', 'spine-right', 'far-right'] %}\r\n    {% if marginSide == 'far-left' %}\r\n      {% set horizontalMarginX = bleed %}\r\n      {% set marginWidth = margin %}\r\n      {% set marginWidthLiteral = marginLiteral %}\r\n    {% elif marginSide == 'spine-left' %}\r\n      {% set horizontalMarginX = backCoverRight %}\r\n      {% set marginWidth = spineMargin %}\r\n      {% set marginWidthLiteral = spineMarginLiteral %}\r\n    {% elif marginSide == 'spine-right' %}\r\n      {% set horizontalMarginX = backCoverRight + spineMargin + spineWidth %}\r\n      {% set marginWidth = spineMargin %}\r\n      {% set marginWidthLiteral = spineMarginLiteral %}\r\n    {% elif marginSide == 'far-right' %}\r\n      {% set horizontalMarginX = fullWidth - bleed - margin %}\r\n      {% set marginWidth = margin %}\r\n      {% set marginWidthLiteral = marginLiteral %}\r\n    {% endif %}\r\n\r\n\r\n    <!-- measuring margin on {{ marginSide }} -->\r\n    {{ horizontalMetric(baseArrowName='margin-arrow',\r\n                        color=marginDark,\r\n                        x0Inches=horizontalMarginX,\r\n                        y0Inches=fullHeight * (9/16),\r\n                        lengthInches=marginWidth,\r\n                        literal=marginWidthLiteral) }}\r\n\r\n  {% endfor %}\r\n\r\n\r\n\r\n  \r\n  {% set spineX = backCoverRight + spineMargin %}\r\n  <!-- measuring spine -->\r\n  {{ horizontalMetric(baseArrowName='spine-arrow',\r\n                      color=spineMeasurementDark,\r\n                      x0Inches=spineX,\r\n                      y0Inches=fullHeight * 0.30,\r\n                      lengthInches=spineWidth,\r\n                      literal=spineWidthLiteral) }}\r\n\r\n  <!-- barcode annotation -->\r\n  {% set barcodeX = backCoverRight - barcodeWidth %}\r\n  {% set barcodeY = backCoverBottom - barcodeHeight %}\r\n  {# halfway across the cover #}\r\n  {% set barcodedAnnotationX = bleed + margin + backCoverWidth * (3 / 4) %}\r\n  {# 3/4 down the cover #}\r\n  {% set barcodedAnnotationY = bleed + margin + backCoverHeight * (3 / 4) %}\r\n  <svg x=\"{{ barcodedAnnotationX - 1}}in\"  y=\"{{ barcodedAnnotationY-1}}in\">\r\n    <text x=\"1in\" y=\"1in\"\r\n      text-anchor=\"end\" \r\n      style=\"stroke:{{ barcodeBorderColor }}; alignment-baseline:middle\">\r\n        {{ barcodeWidthLiteral }}\" x {{ barcodeHeightLiteral }}\"\r\n    </text>\r\n    <svg x=\"1in\" y=\"1in\">\r\n      <line \r\n        x1=\"0.5em\" \r\n        y1=\"0.5em\"\r\n        x2=\"{{ barcodeX + (barcodeWidth/2) - barcodedAnnotationX}}in\"\r\n        y2=\"{{ barcodeY + (barcodeHeight/2) - barcodedAnnotationY}}in\"\r\n        stroke=\"{{ barcodeBorderColor }}\" stroke-width=\"2px\"\r\n        />\r\n    </svg>\r\n  </svg>\r\n</svg>";
 
 function ComputeSVG(_ref) {
   var values = _ref.values;
-  console.log("Computing SVG template with Nunjucks");
+  console.log('Computing SVG template with Nunjucks');
   var svg = nunjucks.renderString(template, values);
-  console.log("Computing SVG done");
+  console.log('Computing SVG done');
   return {
     svg: svg
   };
@@ -73729,11 +74127,11 @@ var UserInterface = /*#__PURE__*/function () {
 
                 if (blob === null) {
                   blob = new Blob([pdf], {
-                    type: "application/pdf"
+                    type: 'application/pdf'
                   });
                 }
 
-                document.getElementById("rhs-display-frame").src = URL.createObjectURL(blob);
+                document.getElementById('rhs-display-frame').src = URL.createObjectURL(blob);
 
               case 4:
               case "end":
@@ -73759,12 +74157,12 @@ var UserInterface = /*#__PURE__*/function () {
             switch (_context2.prev = _context2.next) {
               case 0:
                 svg = _ref4.svg;
-                console.log("Inserting SVG into display area");
+                console.log('Inserting SVG into display area');
                 blob = new Blob([svg], {
-                  type: "image/svg+xml"
+                  type: 'image/svg+xml'
                 });
-                document.getElementById("lhs-display-frame").src = URL.createObjectURL(blob);
-                console.log("Inserting SVG done");
+                document.getElementById('lhs-display-frame').src = URL.createObjectURL(blob);
+                console.log('Inserting SVG done');
 
               case 5:
               case "end":
@@ -73783,8 +74181,8 @@ var UserInterface = /*#__PURE__*/function () {
   }, {
     key: "GetInputsKeys",
     value: function GetInputsKeys() {
-      return $("#input-table input").toArray().map(function (element) {
-        var id = $(element).attr("id");
+      return $('#input-table input').toArray().map(function (element) {
+        var id = $(element).attr('id');
         return id;
       });
     }
@@ -73810,7 +74208,7 @@ var UserInterface = /*#__PURE__*/function () {
           var element = document.getElementById("".concat(key));
           console.log("element: ".concat(element));
 
-          if (element.getAttribute("type") === "number") {
+          if (element.getAttribute('type') === 'number') {
             value = Number.parseFloat(value);
           }
 
@@ -73829,11 +74227,11 @@ var UserInterface = /*#__PURE__*/function () {
           _ref5$scale = _ref5.scale,
           scale = _ref5$scale === void 0 ? 1.0 : _ref5$scale;
 
-      console.log("Computing template parameters from inputs");
-      var values = Object.fromEntries($("#input-table input").toArray().map(function (element) {
-        var id = $(element).attr("id");
+      console.log('Computing template parameters from inputs');
+      var values = Object.fromEntries($('#input-table input').toArray().map(function (element) {
+        var id = $(element).attr('id');
         var value = $(element).val();
-        assert($(element).attr("type") === "number");
+        assert($(element).attr('type') === 'number');
         return [id, Number.parseFloat(value)];
       }));
       var originalKeys = Object.keys(values);
@@ -73851,7 +74249,7 @@ var UserInterface = /*#__PURE__*/function () {
         values[_key] *= scale;
       }
 
-      console.log("Template parameters computed");
+      console.log('Template parameters computed');
       console.log(values);
       return {
         values: values
@@ -73878,8 +74276,8 @@ function RenderFullCoverFromInputs() {
 
 function _RenderFullCoverFromInputs() {
   _RenderFullCoverFromInputs = _asyncToGenerator( /*#__PURE__*/regeneratorRuntime.mark(function _callee4() {
-    var _ref14,
-        _ref14$scale,
+    var _ref10,
+        _ref10$scale,
         scale,
         _ui_$GetSVGInputsFrom,
         values,
@@ -73892,7 +74290,7 @@ function _RenderFullCoverFromInputs() {
       while (1) {
         switch (_context4.prev = _context4.next) {
           case 0:
-            _ref14 = _args4.length > 0 && _args4[0] !== undefined ? _args4[0] : {}, _ref14$scale = _ref14.scale, scale = _ref14$scale === void 0 ? 1.0 : _ref14$scale;
+            _ref10 = _args4.length > 0 && _args4[0] !== undefined ? _args4[0] : {}, _ref10$scale = _ref10.scale, scale = _ref10$scale === void 0 ? 1.0 : _ref10$scale;
             _ui_$GetSVGInputsFrom = ui_.GetSVGInputsFromUI(), values = _ui_$GetSVGInputsFrom.values;
             _ComputeSVG = ComputeSVG({
               values: values
@@ -73932,19 +74330,19 @@ function _RenderFullCoverFromInputs() {
 function SaveToSVG(fname) {
   var svgData = state_.GetSVGFromMemory();
   var svgBlob = new Blob([svgData], {
-    type: "image/svg+xml"
+    type: 'image/svg+xml'
   });
-  console.log("svgBlob:", svgBlob);
+  console.log('svgBlob:', svgBlob);
   FileSaver.saveAs(svgBlob, fname);
 }
 
 function CopyToClipboard(_ref7) {
   var text = _ref7.text;
-  var copyText = document.getElementById("copy-text");
+  var copyText = document.getElementById('copy-text');
   copyText.value = text;
   copyText.select();
   copyText.setSelectionRange(0, text.length + 10000);
-  document.execCommand("copy");
+  document.execCommand('copy');
 }
 
 function CopySVGToClipboard() {
@@ -73954,46 +74352,35 @@ function CopySVGToClipboard() {
   });
 }
 
-function SaveToPDFKendo() {
-  // https://stackoverflow.com/a/46096312/586784
-  assert(false);
-}
-
-function SaveCanvasToPDF(_ref8) {
-  var canvas = _ref8.canvas;
-  // https://github.com/joshua-gould/canvas2pdf
-  assert(false);
-}
-
 function SaveToPDFBlobWithSVGtoPDFKit(_x3) {
   return _SaveToPDFBlobWithSVGtoPDFKit.apply(this, arguments);
 }
 
 function _SaveToPDFBlobWithSVGtoPDFKit() {
-  _SaveToPDFBlobWithSVGtoPDFKit = _asyncToGenerator( /*#__PURE__*/regeneratorRuntime.mark(function _callee5(_ref9) {
+  _SaveToPDFBlobWithSVGtoPDFKit = _asyncToGenerator( /*#__PURE__*/regeneratorRuntime.mark(function _callee5(_ref8) {
     var svg, values;
     return regeneratorRuntime.wrap(function _callee5$(_context5) {
       while (1) {
         switch (_context5.prev = _context5.next) {
           case 0:
-            svg = _ref9.svg, values = _ref9.values;
+            svg = _ref8.svg, values = _ref8.values;
             // https://www.npmjs.com/package/svg-to-pdfkit
-            console.log("SVGtoPDF:", SVGtoPDF);
+            console.log('SVGtoPDF:', SVGtoPDF);
             return _context5.abrupt("return", new Promise(function (resolve, reject) {
               var doc = new PDFDocument({
                 compress: false,
                 size: [values.fullWidth * 72, values.fullHeight * 72]
               });
               var stream = doc.pipe(BlobStream());
-              stream.on("finish", function () {
-                return resolve(stream.toBlob("application/pdf")); // console.log(blob);
+              stream.on('finish', function () {
+                return resolve(stream.toBlob('application/pdf')); // console.log(blob);
               });
               SVGtoPDF(doc, svg,
-              /*x=*/
+              /* x= */
               0,
-              /*y=*/
+              /* y= */
               0,
-              /*options*/
+              /* options */
               {
                 precision: 10,
                 warningCallback: function warningCallback(args) {
@@ -74013,203 +74400,112 @@ function _SaveToPDFBlobWithSVGtoPDFKit() {
   return _SaveToPDFBlobWithSVGtoPDFKit.apply(this, arguments);
 }
 
-function SaveSVGToCanvasWithFabricJS(_ref10) {
-  var svg = _ref10.svg,
-      canvas = _ref10.canvas;
-  assert(false);
-} // https://github.com/yWorks/svg2pdf.js/
-
-
-function SaveSVGToPDFWithSVG2PDF(_ref11) {
-  var svg = _ref11.svg,
-      canvas = _ref11.canvas;
-  assert(false);
-}
-
-function SaveSVGToCanvasWithCanvas2PDFAndWithCanvg(_x4) {
-  return _SaveSVGToCanvasWithCanvas2PDFAndWithCanvg.apply(this, arguments);
-} // https://github.com/likr/svg-dataurl
-
-
-function _SaveSVGToCanvasWithCanvas2PDFAndWithCanvg() {
-  _SaveSVGToCanvasWithCanvas2PDFAndWithCanvg = _asyncToGenerator( /*#__PURE__*/regeneratorRuntime.mark(function _callee6(_ref12) {
-    var svg, stream, ctx, v;
-    return regeneratorRuntime.wrap(function _callee6$(_context6) {
-      while (1) {
-        switch (_context6.prev = _context6.next) {
-          case 0:
-            svg = _ref12.svg;
-            stream = new BlobStream();
-            console.log("canvas2pdf:", canvas2pdf);
-            console.log("PDFDocument:", PDFDocument);
-            ctx = new canvas2pdf.PdfContext(stream);
-            _context6.next = 7;
-            return Canvg.from(ctx, svg);
-
-          case 7:
-            v = _context6.sent;
-            _context6.next = 10;
-            return v.render();
-
-          case 10:
-            assert(false);
-
-          case 11:
-          case "end":
-            return _context6.stop();
-        }
-      }
-    }, _callee6);
-  }));
-  return _SaveSVGToCanvasWithCanvas2PDFAndWithCanvg.apply(this, arguments);
-}
-
-function SaveToPDFWithSVGConverter() {
-  return _SaveToPDFWithSVGConverter.apply(this, arguments);
-}
-
-function _SaveToPDFWithSVGConverter() {
-  _SaveToPDFWithSVGConverter = _asyncToGenerator( /*#__PURE__*/regeneratorRuntime.mark(function _callee7() {
-    var svgData, converter, dataUrl, blob, text;
-    return regeneratorRuntime.wrap(function _callee7$(_context7) {
-      while (1) {
-        switch (_context7.prev = _context7.next) {
-          case 0:
-            assert(false && "This doesn't work.");
-            svgData = state_.GetSVGFromMemory();
-            assert(false && "No longer have SVG in element");
-            _context7.next = 5;
-            return SVGConverter.loadFromElement(document.querySelector("#display-area > svg"));
-
-          case 5:
-            converter = _context7.sent;
-            dataUrl = converter.svgDataURL();
-            blob = DataURLtoBlob(dataUrl);
-            _context7.next = 10;
-            return blob.text().then();
-
-          case 10:
-            text = _context7.sent;
-            CopyToClipboard({
-              text: text
-            });
-
-          case 12:
-          case "end":
-            return _context7.stop();
-        }
-      }
-    }, _callee7);
-  }));
-  return _SaveToPDFWithSVGConverter.apply(this, arguments);
-}
-
-console.log("Nothing is hooked up; awaiting document ready");
+console.log('Nothing is hooked up; awaiting document ready');
 
 function Initialize() {
   return _Initialize.apply(this, arguments);
 }
 
 function _Initialize() {
-  _Initialize = _asyncToGenerator( /*#__PURE__*/regeneratorRuntime.mark(function _callee10() {
-    return regeneratorRuntime.wrap(function _callee10$(_context10) {
+  _Initialize = _asyncToGenerator( /*#__PURE__*/regeneratorRuntime.mark(function _callee8() {
+    return regeneratorRuntime.wrap(function _callee8$(_context8) {
       while (1) {
-        switch (_context10.prev = _context10.next) {
+        switch (_context8.prev = _context8.next) {
           case 0:
-            console.log("Document is ready");
+            console.log('Document is ready');
             ui_.SetInputValuesFromURL();
-            console.log("Rendering SVG from initial inputs");
-            _context10.next = 5;
+            console.log('Rendering SVG from initial inputs');
+            _context8.next = 5;
             return RenderFullCoverFromInputs();
 
           case 5:
-            console.log("Rendering SVG from initial inputs, done.");
-            console.log("Hooking up various event handlers.");
-            console.log("Hooking up compute button."); // Hook up compute button.
+            console.log('Rendering SVG from initial inputs, done.');
+            console.log('Hooking up various event handlers.');
+            console.log('Hooking up compute button.'); // Hook up compute button.
 
-            $("#compute").on("click", /*#__PURE__*/_asyncToGenerator( /*#__PURE__*/regeneratorRuntime.mark(function _callee8() {
-              return regeneratorRuntime.wrap(function _callee8$(_context8) {
+            $('#compute').on('click', /*#__PURE__*/_asyncToGenerator( /*#__PURE__*/regeneratorRuntime.mark(function _callee6() {
+              return regeneratorRuntime.wrap(function _callee6$(_context6) {
                 while (1) {
-                  switch (_context8.prev = _context8.next) {
+                  switch (_context6.prev = _context6.next) {
                     case 0:
-                      console.log("Compute button was clicked.");
-                      console.log("Rendering SVG from current inputs");
-                      _context8.next = 4;
+                      console.log('Compute button was clicked.');
+                      console.log('Rendering SVG from current inputs');
+                      _context6.next = 4;
                       return RenderFullCoverFromInputs();
 
                     case 4:
-                      console.log("Rendering SVG from current inputs, done.");
+                      console.log('Rendering SVG from current inputs, done.');
 
                     case 5:
                     case "end":
-                      return _context8.stop();
+                      return _context6.stop();
                   }
                 }
-              }, _callee8);
+              }, _callee6);
             })));
-            console.log("Hooking up input box changes."); // Hook up input box changes
+            console.log('Hooking up input box changes.'); // Hook up input box changes
 
-            $("#input-table input").on("input", function () {
-              console.log("Input box has changed.");
-              console.log("Clearing the display area."); // DO NOT SUBMIT
+            $('#input-table input').on('input', function () {
+              console.log('Input box has changed.');
+              console.log('Clearing the display area.'); // DO NOT SUBMIT
               // document.getElementById("display-area").innerHTML = "";
 
-              console.log("Display area is clear.");
+              console.log('Display area is clear.');
             });
-            console.log("Hooking up save-to-pdf button."); // Hook up save-to-pdf.
+            console.log('Hooking up save-to-pdf button.'); // Hook up save-to-pdf.
             // DO NOT SUBMIT: make this a separate function
 
-            $("#save-pdf").on("click", /*#__PURE__*/_asyncToGenerator( /*#__PURE__*/regeneratorRuntime.mark(function _callee9() {
+            $('#save-pdf').on('click', /*#__PURE__*/_asyncToGenerator( /*#__PURE__*/regeneratorRuntime.mark(function _callee7() {
               var blob;
-              return regeneratorRuntime.wrap(function _callee9$(_context9) {
+              return regeneratorRuntime.wrap(function _callee7$(_context7) {
                 while (1) {
-                  switch (_context9.prev = _context9.next) {
+                  switch (_context7.prev = _context7.next) {
                     case 0:
-                      _context9.next = 2;
+                      _context7.next = 2;
                       return SaveToPDFBlobWithSVGtoPDFKit({
                         svg: state_.GetSVGFromMemory(),
                         values: ui_.GetSVGInputsFromUI().values
                       });
 
                     case 2:
-                      blob = _context9.sent;
+                      blob = _context7.sent;
                       ui_.SavePDFBlobToFile({
                         blob: blob,
-                        fname: "FullCover.pdf"
+                        fname: 'FullCover.pdf'
                       });
 
                     case 4:
                     case "end":
-                      return _context9.stop();
+                      return _context7.stop();
                   }
                 }
-              }, _callee9);
+              }, _callee7);
             })));
             console.log('Getting rid of "Loading" message.');
-            $("#loading").remove();
-            console.log("Enabling the compute button.");
-            $("#compute").removeAttr("disabled");
-            $("#save-pdf").removeAttr("disabled");
-            $("#save-svg").removeAttr("disabled");
-            $("#copy-svg").removeAttr("disabled");
-            $("#special").removeAttr("disabled");
+            $('#loading').remove();
+            console.log('Enabling the compute button.');
+            $('#compute').removeAttr('disabled');
+            $('#save-pdf').removeAttr('disabled');
+            $('#save-svg').removeAttr('disabled');
+            $('#copy-svg').removeAttr('disabled');
+            $('#special').removeAttr('disabled');
 
           case 21:
           case "end":
-            return _context10.stop();
+            return _context8.stop();
         }
       }
-    }, _callee10);
+    }, _callee8);
   }));
   return _Initialize.apply(this, arguments);
 }
 
-console.log("Hooking up save-to-pdf button."); // Hook up save-to-svg.
+console.log('Hooking up save-to-pdf button.'); // Hook up save-to-svg.
 
-$("#save-svg").on("click", function () {
-  return SaveToSVG("FullCover.svg");
+$('#save-svg').on('click', function () {
+  return SaveToSVG('FullCover.svg');
 });
-$("#copy-svg").on("click", function () {
+$('#copy-svg').on('click', function () {
   return CopySVGToClipboard();
 }); // $("#special").on("click", async () => {
 //   const blob = await SaveToPDFBlobWithSVGtoPDFKit({
@@ -74255,7 +74551,7 @@ $(document).ready( /*#__PURE__*/_asyncToGenerator( /*#__PURE__*/regeneratorRunti
 //   checkInit();
 // }, 100);
 // window.getSVGData = getSVGData;
-},{"./styles.css":"src/styles.css","regenerator-runtime/runtime":"node_modules/regenerator-runtime/runtime.js","fs":"node_modules/parcel-bundler/src/builtins/_empty.js","path":"node_modules/path-browserify/index.js","jquery":"node_modules/jquery/dist/jquery.js","nunjucks":"node_modules/nunjucks/browser/nunjucks.js","assert":"node_modules/assert/assert.js","file-saver":"node_modules/file-saver/dist/FileSaver.min.js","blob-stream":"node_modules/blob-stream/index.js","pdfkit-browserify":"node_modules/pdfkit-browserify/index.js","svg-to-pdfkit":"node_modules/svg-to-pdfkit/source.js"}],"node_modules/parcel-bundler/src/builtins/hmr-runtime.js":[function(require,module,exports) {
+},{"./styles.css":"src/styles.css","regenerator-runtime/runtime":"node_modules/regenerator-runtime/runtime.js","fs":"node_modules/parcel-bundler/src/builtins/_empty.js","cross-blob":"node_modules/cross-blob/browser.js","jquery":"node_modules/jquery/dist/jquery.js","nunjucks":"node_modules/nunjucks/browser/nunjucks.js","assert":"node_modules/assert/assert.js","file-saver":"node_modules/file-saver/dist/FileSaver.min.js","blob-stream":"node_modules/blob-stream/index.js","pdfkit-browserify":"node_modules/pdfkit-browserify/index.js","svg-to-pdfkit":"node_modules/svg-to-pdfkit/source.js"}],"node_modules/parcel-bundler/src/builtins/hmr-runtime.js":[function(require,module,exports) {
 var global = arguments[3];
 var OVERLAY_ID = '__parcel__error__overlay__';
 var OldModule = module.bundle.Module;
@@ -74283,7 +74579,7 @@ var parent = module.bundle.parent;
 if ((!parent || !parent.isParcelRequire) && typeof WebSocket !== 'undefined') {
   var hostname = "" || location.hostname;
   var protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  var ws = new WebSocket(protocol + '://' + hostname + ':' + "40499" + '/');
+  var ws = new WebSocket(protocol + '://' + hostname + ':' + "34203" + '/');
 
   ws.onmessage = function (event) {
     checkedAssets = {};
